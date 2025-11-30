@@ -46,10 +46,13 @@ func (s *server) Decrypt(ctx context.Context, req *pb.DecryptRequest) (*pb.Decry
 	if keyVersion == 0 {
 		keyVersion = 1
 	}
-	log.Printf("[Decrypt] Received request, ciphertext size: %d bytes, key version: %d", len(req.Ciphertext), keyVersion)
+	log.Printf("[Decrypt] Request: ciphertext=%d bytes, iv=%d bytes, authTag=%d bytes, version=%d",
+		len(req.Ciphertext), len(req.Iv), len(req.AuthTag), keyVersion)
+	log.Printf("[Decrypt] Available versions: %v, has v%d: %v",
+		s.engine.AvailableVersions(), keyVersion, s.engine.HasVersion(keyVersion))
 	plaintext, err := s.engine.Decrypt(req.Ciphertext, req.Iv, req.AuthTag, keyVersion)
 	if err != nil {
-		log.Printf("[Decrypt] Error: %v", err)
+		log.Printf("[Decrypt] FAILED for version %d: %v", keyVersion, err)
 		return nil, err
 	}
 	log.Printf("[Decrypt] Success, plaintext size: %d bytes", len(plaintext))
