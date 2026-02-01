@@ -5,7 +5,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o keyway-crypto .
 
-FROM alpine:3.19
+FROM alpine:3.23.3
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/keyway-crypto /usr/local/bin/
 ENV ENCRYPTION_KEY=""
