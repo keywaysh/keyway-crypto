@@ -2,17 +2,28 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"keyway-crypto/crypto"
 	"keyway-crypto/pb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -744,5 +755,648 @@ func TestGRPC_ConcurrentRequests(t *testing.T) {
 				t.Errorf("error %d: %v", i, err)
 			}
 		}
+	}
+}
+
+// =============================================================================
+// TLS / mTLS Tests
+// =============================================================================
+
+// generateCA creates a self-signed CA certificate and key for testing.
+func generateCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+
+	caTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{Organization: []string{"Test CA"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:         true,
+		BasicConstraintsValid: true,
+	}
+
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create CA certificate: %v", err)
+	}
+
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("failed to parse CA certificate: %v", err)
+	}
+
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	return caCert, caKey, caPEM
+}
+
+// generateCert creates a certificate signed by the given CA for testing.
+func generateCert(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, isServer bool) ([]byte, []byte) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{Organization: []string{"Test"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"localhost", "bufnet"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	if isServer {
+		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	} else {
+		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("failed to marshal key: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
+}
+
+// writeTempFile writes data to a temporary file and returns its path.
+func writeTempFile(t *testing.T, dir, name string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	return path
+}
+
+// setupTLSTestServer creates a gRPC server with TLS (no client auth).
+func setupTLSTestServer(t *testing.T, keys map[uint32]string, serverCertPEM, serverKeyPEM, caPEM []byte) (pb.CryptoServiceClient, func()) {
+	t.Helper()
+
+	engine, err := crypto.NewMultiEngine(keys)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load server cert: %v", err)
+	}
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	lis := bufconn.Listen(bufSize)
+	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	pb.RegisterCryptoServiceServer(s, &server{engine: engine})
+
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			// Server stopped
+		}
+	}()
+
+	// Client trusts the CA
+	certPool := x509.NewCertPool()
+	certPool.AppendCertsFromPEM(caPEM)
+
+	clientTLS := credentials.NewTLS(&tls.Config{
+		RootCAs:    certPool,
+		ServerName: "bufnet",
+		MinVersion: tls.VersionTLS13,
+	})
+
+	dialer := func(context.Context, string) (net.Conn, error) {
+		return lis.Dial()
+	}
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(clientTLS),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	client := pb.NewCryptoServiceClient(conn)
+	cleanup := func() {
+		conn.Close()
+		s.Stop()
+	}
+	return client, cleanup
+}
+
+// setupMTLSTestServer creates a gRPC server with mTLS (requires client cert).
+func setupMTLSTestServer(t *testing.T, keys map[uint32]string, serverCertPEM, serverKeyPEM, caPEM, clientCertPEM, clientKeyPEM []byte) (pb.CryptoServiceClient, func()) {
+	t.Helper()
+
+	engine, err := crypto.NewMultiEngine(keys)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load server cert: %v", err)
+	}
+
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AppendCertsFromPEM(caPEM)
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAPool,
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	lis := bufconn.Listen(bufSize)
+	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	pb.RegisterCryptoServiceServer(s, &server{engine: engine})
+
+	go func() {
+		if err := s.Serve(lis); err != nil {
+			// Server stopped
+		}
+	}()
+
+	// Client with cert + trusts server CA
+	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load client cert: %v", err)
+	}
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(caPEM)
+
+	clientTLS := credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{clientCert},
+		RootCAs:      rootPool,
+		ServerName:   "bufnet",
+		MinVersion:   tls.VersionTLS13,
+	})
+
+	dialer := func(context.Context, string) (net.Conn, error) {
+		return lis.Dial()
+	}
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(clientTLS),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	client := pb.NewCryptoServiceClient(conn)
+	cleanup := func() {
+		conn.Close()
+		s.Stop()
+	}
+	return client, cleanup
+}
+
+func TestTLS_EncryptDecryptRoundTrip(t *testing.T) {
+	ca, caKey, caPEM := generateCA(t)
+	serverCertPEM, serverKeyPEM := generateCert(t, ca, caKey, true)
+
+	client, cleanup := setupTLSTestServer(t, map[uint32]string{1: testKey}, serverCertPEM, serverKeyPEM, caPEM)
+	defer cleanup()
+
+	plaintext := []byte("TLS secured data")
+
+	encResp, err := client.Encrypt(context.Background(), &pb.EncryptRequest{Plaintext: plaintext})
+	if err != nil {
+		t.Fatalf("Encrypt over TLS failed: %v", err)
+	}
+
+	decResp, err := client.Decrypt(context.Background(), &pb.DecryptRequest{
+		Ciphertext: encResp.Ciphertext,
+		Iv:         encResp.Iv,
+		AuthTag:    encResp.AuthTag,
+		Version:    encResp.Version,
+	})
+	if err != nil {
+		t.Fatalf("Decrypt over TLS failed: %v", err)
+	}
+
+	if string(decResp.Plaintext) != string(plaintext) {
+		t.Errorf("expected %q, got %q", plaintext, decResp.Plaintext)
+	}
+}
+
+func TestTLS_InsecureClientRejected(t *testing.T) {
+	ca, caKey, _ := generateCA(t)
+	serverCertPEM, serverKeyPEM := generateCert(t, ca, caKey, true)
+
+	// Setup server with TLS
+	engine, err := crypto.NewMultiEngine(map[uint32]string{1: testKey})
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load server cert: %v", err)
+	}
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	lis := bufconn.Listen(bufSize)
+	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	pb.RegisterCryptoServiceServer(s, &server{engine: engine})
+
+	go func() {
+		s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	// Try connecting without TLS credentials (insecure)
+	dialer := func(context.Context, string) (net.Conn, error) {
+		return lis.Dial()
+	}
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewCryptoServiceClient(conn)
+	_, err = client.HealthCheck(context.Background(), &pb.Empty{})
+	if err == nil {
+		t.Fatal("expected error when insecure client connects to TLS server")
+	}
+}
+
+func TestMTLS_EncryptDecryptRoundTrip(t *testing.T) {
+	ca, caKey, caPEM := generateCA(t)
+	serverCertPEM, serverKeyPEM := generateCert(t, ca, caKey, true)
+	clientCertPEM, clientKeyPEM := generateCert(t, ca, caKey, false)
+
+	client, cleanup := setupMTLSTestServer(t, map[uint32]string{1: testKey},
+		serverCertPEM, serverKeyPEM, caPEM, clientCertPEM, clientKeyPEM)
+	defer cleanup()
+
+	plaintext := []byte("mTLS secured data")
+
+	encResp, err := client.Encrypt(context.Background(), &pb.EncryptRequest{Plaintext: plaintext})
+	if err != nil {
+		t.Fatalf("Encrypt over mTLS failed: %v", err)
+	}
+
+	decResp, err := client.Decrypt(context.Background(), &pb.DecryptRequest{
+		Ciphertext: encResp.Ciphertext,
+		Iv:         encResp.Iv,
+		AuthTag:    encResp.AuthTag,
+		Version:    encResp.Version,
+	})
+	if err != nil {
+		t.Fatalf("Decrypt over mTLS failed: %v", err)
+	}
+
+	if string(decResp.Plaintext) != string(plaintext) {
+		t.Errorf("expected %q, got %q", plaintext, decResp.Plaintext)
+	}
+}
+
+func TestMTLS_ClientWithoutCertRejected(t *testing.T) {
+	ca, caKey, caPEM := generateCA(t)
+	serverCertPEM, serverKeyPEM := generateCert(t, ca, caKey, true)
+
+	// Setup mTLS server
+	engine, err := crypto.NewMultiEngine(map[uint32]string{1: testKey})
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load server cert: %v", err)
+	}
+
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AppendCertsFromPEM(caPEM)
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAPool,
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	lis := bufconn.Listen(bufSize)
+	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	pb.RegisterCryptoServiceServer(s, &server{engine: engine})
+
+	go func() {
+		s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	// Client trusts the CA but does NOT present a client certificate
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(caPEM)
+
+	clientTLS := credentials.NewTLS(&tls.Config{
+		RootCAs:    rootPool,
+		ServerName: "bufnet",
+		MinVersion: tls.VersionTLS13,
+	})
+
+	dialer := func(context.Context, string) (net.Conn, error) {
+		return lis.Dial()
+	}
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(clientTLS),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewCryptoServiceClient(conn)
+	_, err = client.HealthCheck(context.Background(), &pb.Empty{})
+	if err == nil {
+		t.Fatal("expected error when client without cert connects to mTLS server")
+	}
+}
+
+func TestMTLS_ClientWithWrongCARejected(t *testing.T) {
+	// Server CA
+	serverCA, serverCAKey, serverCAPEM := generateCA(t)
+	serverCertPEM, serverKeyPEM := generateCert(t, serverCA, serverCAKey, true)
+
+	// Different CA for client (not trusted by server)
+	untrustedCA, untrustedCAKey, _ := generateCA(t)
+	untrustedClientCertPEM, untrustedClientKeyPEM := generateCert(t, untrustedCA, untrustedCAKey, false)
+
+	// Setup mTLS server that only trusts serverCA
+	engine, err := crypto.NewMultiEngine(map[uint32]string{1: testKey})
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+
+	serverCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load server cert: %v", err)
+	}
+
+	trustedPool := x509.NewCertPool()
+	trustedPool.AppendCertsFromPEM(serverCAPEM)
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    trustedPool,
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	lis := bufconn.Listen(bufSize)
+	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	pb.RegisterCryptoServiceServer(s, &server{engine: engine})
+
+	go func() {
+		s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	// Client with cert from untrusted CA
+	clientCert, err := tls.X509KeyPair(untrustedClientCertPEM, untrustedClientKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to load untrusted client cert: %v", err)
+	}
+
+	rootPool := x509.NewCertPool()
+	rootPool.AppendCertsFromPEM(serverCAPEM)
+
+	clientTLS := credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{clientCert},
+		RootCAs:      rootPool,
+		ServerName:   "bufnet",
+		MinVersion:   tls.VersionTLS13,
+	})
+
+	dialer := func(context.Context, string) (net.Conn, error) {
+		return lis.Dial()
+	}
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(clientTLS),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewCryptoServiceClient(conn)
+	_, err = client.HealthCheck(context.Background(), &pb.Empty{})
+	if err == nil {
+		t.Fatal("expected error when client cert is from untrusted CA")
+	}
+}
+
+// =============================================================================
+// loadTLSCredentials Unit Tests
+// =============================================================================
+
+func TestLoadTLSCredentials_NoEnvReturnsNil(t *testing.T) {
+	os.Unsetenv("TLS_CERT_FILE")
+	os.Unsetenv("TLS_KEY_FILE")
+	os.Unsetenv("TLS_CLIENT_CA_FILE")
+
+	creds, err := loadTLSCredentials()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if creds != nil {
+		t.Error("expected nil credentials when no env vars set")
+	}
+}
+
+func TestLoadTLSCredentials_OnlyCertErrors(t *testing.T) {
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+	}()
+
+	os.Setenv("TLS_CERT_FILE", "/some/cert.pem")
+	os.Unsetenv("TLS_KEY_FILE")
+
+	_, err := loadTLSCredentials()
+	if err == nil {
+		t.Fatal("expected error when only cert is set")
+	}
+	if !strings.Contains(err.Error(), "both TLS_CERT_FILE and TLS_KEY_FILE must be set") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTLSCredentials_OnlyKeyErrors(t *testing.T) {
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+	}()
+
+	os.Unsetenv("TLS_CERT_FILE")
+	os.Setenv("TLS_KEY_FILE", "/some/key.pem")
+
+	_, err := loadTLSCredentials()
+	if err == nil {
+		t.Fatal("expected error when only key is set")
+	}
+	if !strings.Contains(err.Error(), "both TLS_CERT_FILE and TLS_KEY_FILE must be set") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTLSCredentials_InvalidCertFileErrors(t *testing.T) {
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+	}()
+
+	os.Setenv("TLS_CERT_FILE", "/nonexistent/cert.pem")
+	os.Setenv("TLS_KEY_FILE", "/nonexistent/key.pem")
+
+	_, err := loadTLSCredentials()
+	if err == nil {
+		t.Fatal("expected error for nonexistent cert files")
+	}
+	if !strings.Contains(err.Error(), "failed to load server certificate") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTLSCredentials_ValidTLS(t *testing.T) {
+	ca, caKey, _ := generateCA(t)
+	certPEM, keyPEM := generateCert(t, ca, caKey, true)
+
+	dir := t.TempDir()
+	certPath := writeTempFile(t, dir, "server.crt", certPEM)
+	keyPath := writeTempFile(t, dir, "server.key", keyPEM)
+
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+		os.Unsetenv("TLS_CLIENT_CA_FILE")
+	}()
+
+	os.Setenv("TLS_CERT_FILE", certPath)
+	os.Setenv("TLS_KEY_FILE", keyPath)
+	os.Unsetenv("TLS_CLIENT_CA_FILE")
+
+	creds, err := loadTLSCredentials()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("expected non-nil credentials")
+	}
+}
+
+func TestLoadTLSCredentials_ValidMTLS(t *testing.T) {
+	ca, caKey, caPEM := generateCA(t)
+	certPEM, keyPEM := generateCert(t, ca, caKey, true)
+
+	dir := t.TempDir()
+	certPath := writeTempFile(t, dir, "server.crt", certPEM)
+	keyPath := writeTempFile(t, dir, "server.key", keyPEM)
+	caPath := writeTempFile(t, dir, "ca.crt", caPEM)
+
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+		os.Unsetenv("TLS_CLIENT_CA_FILE")
+	}()
+
+	os.Setenv("TLS_CERT_FILE", certPath)
+	os.Setenv("TLS_KEY_FILE", keyPath)
+	os.Setenv("TLS_CLIENT_CA_FILE", caPath)
+
+	creds, err := loadTLSCredentials()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if creds == nil {
+		t.Fatal("expected non-nil credentials")
+	}
+}
+
+func TestLoadTLSCredentials_InvalidClientCAErrors(t *testing.T) {
+	ca, caKey, _ := generateCA(t)
+	certPEM, keyPEM := generateCert(t, ca, caKey, true)
+
+	dir := t.TempDir()
+	certPath := writeTempFile(t, dir, "server.crt", certPEM)
+	keyPath := writeTempFile(t, dir, "server.key", keyPEM)
+
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+		os.Unsetenv("TLS_CLIENT_CA_FILE")
+	}()
+
+	os.Setenv("TLS_CERT_FILE", certPath)
+	os.Setenv("TLS_KEY_FILE", keyPath)
+	os.Setenv("TLS_CLIENT_CA_FILE", "/nonexistent/ca.pem")
+
+	_, err := loadTLSCredentials()
+	if err == nil {
+		t.Fatal("expected error for nonexistent CA file")
+	}
+	if !strings.Contains(err.Error(), "failed to read client CA certificate") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTLSCredentials_InvalidClientCAPEMErrors(t *testing.T) {
+	ca, caKey, _ := generateCA(t)
+	certPEM, keyPEM := generateCert(t, ca, caKey, true)
+
+	dir := t.TempDir()
+	certPath := writeTempFile(t, dir, "server.crt", certPEM)
+	keyPath := writeTempFile(t, dir, "server.key", keyPEM)
+	badCAPath := writeTempFile(t, dir, "bad-ca.crt", []byte("not a valid PEM"))
+
+	defer func() {
+		os.Unsetenv("TLS_CERT_FILE")
+		os.Unsetenv("TLS_KEY_FILE")
+		os.Unsetenv("TLS_CLIENT_CA_FILE")
+	}()
+
+	os.Setenv("TLS_CERT_FILE", certPath)
+	os.Setenv("TLS_KEY_FILE", keyPath)
+	os.Setenv("TLS_CLIENT_CA_FILE", badCAPath)
+
+	_, err := loadTLSCredentials()
+	if err == nil {
+		t.Fatal("expected error for invalid CA PEM")
+	}
+	if !strings.Contains(err.Error(), "failed to parse client CA certificate") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
