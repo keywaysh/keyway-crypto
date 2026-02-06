@@ -6,8 +6,10 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o keyway-crypto .
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S crypto && adduser -S crypto -G crypto
 COPY --from=builder /app/keyway-crypto /usr/local/bin/
 ENV ENCRYPTION_KEY=""
 EXPOSE 50051
+USER crypto
 CMD ["keyway-crypto"]
