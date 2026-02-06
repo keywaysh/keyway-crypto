@@ -1,6 +1,6 @@
 # keyway-crypto
 
-Microservice Go for encrypting/decrypting Keyway secrets using AES-256-GCM.
+Go microservice for encrypting and decrypting [Keyway](https://keyway.sh) secrets using AES-256-GCM.
 
 ## Why a separate service?
 
