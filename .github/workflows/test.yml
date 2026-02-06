@@ -26,3 +26,6 @@ jobs:
 
       - name: Show coverage
         run: go tool cover -func=coverage.out | tail -1
+
+      - name: Vulnerability check
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...

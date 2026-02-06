@@ -14,15 +14,20 @@ This microservice isolates the encryption key from the main backend:
 ## Architecture
 
 ```
-┌─────────────────┐       gRPC (mTLS)      ┌─────────────────────┐
-│  keyway-backend │ ◄────────────────────► │  keyway-crypto      │
-│    (Node.js)    │      :50051            │       (Go)          │
-└─────────────────┘                        └─────────────────────┘
-                                                   │
-                                                   ▼
-                                            ENCRYPTION_KEY
-                                           (env, never logged)
+  Internet (untrusted)
+         │
+         ▼
+┌─────────────────┐    gRPC (private network)   ┌─────────────────────┐
+│  keyway-backend │ ◄──────────────────────────► │  keyway-crypto      │
+│    (Node.js)    │         :50051               │       (Go)          │
+└─────────────────┘                              └─────────────────────┘
+                                                          │
+                                                          ▼
+                                                   ENCRYPTION_KEY
+                                                  (env, never logged)
 ```
+
+> **Important**: keyway-crypto must run on an isolated private network (Docker internal network, private VPC, or Kubernetes pod network). It must never be exposed to the public internet. See [SECURITY.md](./SECURITY.md) for the full threat model.
 
 ## Encryption Details
 
@@ -67,8 +72,11 @@ ENCRYPTION_KEY=<64-hex-chars> make run
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `ENCRYPTION_KEY` | AES-256 key in hex (64 chars) | Yes |
-| `PORT` | gRPC server port (default: 50051) | No |
+| `ENCRYPTION_KEY` | Single AES-256 key in hex (64 chars) | Yes* |
+| `ENCRYPTION_KEYS` | Versioned keys for rotation (e.g., `1:key1,2:key2`) | Yes* |
+| `GRPC_PORT` | gRPC server port (default: 50051) | No |
+
+\* Either `ENCRYPTION_KEY` or `ENCRYPTION_KEYS` must be set. `ENCRYPTION_KEYS` takes priority if both are set.
 
 ### Generating a secure key
 
@@ -161,12 +169,17 @@ CRYPTO_SERVICE_URL=localhost:50051 pnpm run dev
 CRYPTO_SERVICE_URL=crypto:50051
 ```
 
-## Security Considerations
+## Security
 
-1. **Key management**: Never commit `ENCRYPTION_KEY` to version control
-2. **Network**: Deploy in a private network, use mTLS in production
-3. **Logging**: The service never logs plaintext or keys
-4. **Memory**: Sensitive data is not retained after request completion
+See [SECURITY.md](./SECURITY.md) for the full threat model and vulnerability disclosure policy.
+
+Key points:
+
+1. **Network isolation required**: This service must run on a private network (Docker network, VPC). Never expose port 50051 to the internet.
+2. **Key management**: Never commit `ENCRYPTION_KEY` to version control. Use a secrets manager in production.
+3. **Key rotation**: Use `ENCRYPTION_KEYS` with versioned keys (e.g., `1:oldkey,2:newkey`) for zero-downtime rotation.
+4. **Logging**: The service never logs plaintext, ciphertext, IVs, auth tags, or keys.
+5. **mTLS**: Optional but recommended for high-security environments. Network isolation provides the baseline transport security.
 
 ## Make Commands
 
